@@ -1,3 +1,5 @@
 out/
 .vs/
 Borderless Window Helper/CMakeUserPresets.json
+/Borderless Window Helper/compile_commands.json
+.cache/
