@@ -4,7 +4,7 @@
         {
             "name": "gcc",
             "generator": "Ninja",
-            "binaryDir": "${sourceDir}/build",
+            "binaryDir": "${sourceDir}/build-gcc",
             "cacheVariables": {
                 "CMAKE_BUILD_TYPE": "Release"
             }
