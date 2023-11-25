@@ -3,7 +3,7 @@ project(Borderless-Window-Helper VERSION 2.2.0 LANGUAGES CXX)
 
 if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
   set(CMAKE_INSTALL_PREFIX
-    "${PROJECT_NAME}-${PROJECT_VERSION}"
+    "Borderless-Window-Helper-${PROJECT_VERSION}"
     CACHE
     PATH
     "installation directory"
@@ -16,20 +16,16 @@ if(CCACHE)
   set(CMAKE_CXX_COMPILER_LAUNCHER ccache)
 endif()
 
-add_executable(${PROJECT_NAME}
+add_executable(Borderless-Window-Helper
   WIN32
   inifile.cpp
   main.cpp
   util.cpp
 )
 
-if(MSVC)
-  target_sources(${PROJECT_NAME} PRIVATE "Borderless Window Helper.rc")
-else()
-  target_sources(${PROJECT_NAME} PRIVATE "Borderless-Window-Helper.rc")
-endif()
+target_sources(Borderless-Window-Helper PRIVATE "Borderless Window Helper.rc")
 
-target_compile_definitions(${PROJECT_NAME} PRIVATE -DUNICODE -D_UNICODE)
+target_compile_definitions(Borderless-Window-Helper PRIVATE UNICODE _UNICODE)
 
 include(cmake/CPM.cmake)
 
@@ -41,10 +37,10 @@ CPMAddPackage(
   GIT_TAG 3ff1380bcd482d6cfa2c7787923bdd0b82230f6f
 )
 
-target_link_libraries(${PROJECT_NAME} PRIVATE nana::nana)
+target_link_libraries(Borderless-Window-Helper PRIVATE nana::nana)
 
 if(NOT MSVC)
-  target_link_options(${PROJECT_NAME}
+  target_link_options(Borderless-Window-Helper
     PRIVATE
     -municode
     -static
@@ -54,14 +50,14 @@ if(NOT MSVC)
 endif()
 
 if(MSVC)
-  target_compile_options(${PROJECT_NAME}
+  target_compile_options(Borderless-Window-Helper
     PRIVATE
     /MT # build static exe
   )
 endif()
 
-target_compile_features(${PROJECT_NAME} PRIVATE cxx_std_17)
+target_compile_features(Borderless-Window-Helper PRIVATE cxx_std_17)
 
 set(CPACK_GENERATOR ZIP)
 include(CPack)
-install(TARGETS ${PROJECT_NAME} RUNTIME DESTINATION .)
+install(TARGETS Borderless-Window-Helper RUNTIME DESTINATION .)
