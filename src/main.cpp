@@ -14,6 +14,7 @@
 #include "inifile.h"
 #include "nana_subclassing.h"
 #include "tinyformat.h"
+#include "util.h"
 
 using namespace std;
 using namespace nana;
