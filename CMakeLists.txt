@@ -1,6 +1,8 @@
 cmake_minimum_required(VERSION 3.12 FATAL_ERROR)
 project(Borderless-Window-Helper VERSION 2.2.0 LANGUAGES CXX)
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+
 if(CMAKE_INSTALL_PREFIX_INITIALIZED_TO_DEFAULT)
   set(CMAKE_INSTALL_PREFIX
     "Borderless-Window-Helper-${PROJECT_VERSION}"
@@ -18,12 +20,12 @@ endif()
 
 add_executable(Borderless-Window-Helper
   WIN32
-  inifile.cpp
-  main.cpp
-  util.cpp
+  src/inifile.cpp
+  src/main.cpp
+  src/util.cpp
 )
 
-target_sources(Borderless-Window-Helper PRIVATE "Borderless Window Helper.rc")
+target_sources(Borderless-Window-Helper PRIVATE "src/Borderless Window Helper.rc")
 
 target_compile_definitions(Borderless-Window-Helper PRIVATE UNICODE _UNICODE)
 
