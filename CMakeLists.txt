@@ -36,8 +36,10 @@ option(NANA_CMAKE_ENABLE_CONF "enable config.hpp" ON)
 CPMAddPackage(
   NAME nana
   GITHUB_REPOSITORY cnjinhao/nana
-  GIT_TAG 3ff1380bcd482d6cfa2c7787923bdd0b82230f6f
+  GIT_TAG f49f931be49c4d6890fbd2d56f7402017a9fb793
 )
+
+target_compile_definitions(nana PRIVATE NANA_ENABLE_VIRTUAL_KEYBOARD)
 
 target_link_libraries(Borderless-Window-Helper PRIVATE nana::nana)
 
