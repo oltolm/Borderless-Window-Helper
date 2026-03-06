@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.12 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.15 FATAL_ERROR)
 project(Borderless-Window-Helper VERSION 2.2.0 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
@@ -14,7 +14,6 @@ endif()
 
 find_program(CCACHE ccache)
 if(CCACHE)
-  message(STATUS "found ccache: ${CCACHE}")
   set(CMAKE_CXX_COMPILER_LAUNCHER ccache)
 endif()
 
@@ -53,12 +52,7 @@ if(NOT MSVC)
   )
 endif()
 
-if(MSVC)
-  target_compile_options(Borderless-Window-Helper
-    PRIVATE
-    /MT # build static exe
-  )
-endif()
+set_target_properties(Borderless-Window-Helper PROPERTIES MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>")
 
 target_compile_features(Borderless-Window-Helper PRIVATE cxx_std_17)
 
