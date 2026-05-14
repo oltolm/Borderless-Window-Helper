@@ -44,7 +44,7 @@ HRESULT createShortcut(const std::filesystem::path &linkFileName, const std::fil
 {
     HRESULT hres;
     WRL::ComPtr<IShellLinkW> psl;
-    hres = ::CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_IShellLinkW, &psl);
+    hres = ::CoCreateInstance(CLSID_ShellLink, NULL, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&psl));
     if (SUCCEEDED(hres))
     {
         WRL::ComPtr<IPersistFile> ppf;
