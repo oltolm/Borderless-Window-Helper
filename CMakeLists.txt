@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.15 FATAL_ERROR)
-project(Borderless-Window-Helper VERSION 2.2.0 LANGUAGES CXX)
+project(Borderless-Window-Helper VERSION 2.3.0 LANGUAGES CXX)
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
