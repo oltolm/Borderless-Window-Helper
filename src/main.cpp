@@ -1,592 +1,401 @@
-#include "main.h"
-
-#include <Psapi.h>
+#include <windows.h>
+#include <commctrl.h>
+#include <shellapi.h>
 #include <shlobj.h>
-
+#include <ini.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <filesystem>
 #include <map>
-#include <nana/gui.hpp>
-#include <nana/gui/notifier.hpp>
-#include <nana/gui/timer.hpp>
-#include <nana/gui/widgets/group.hpp>
-#include <nana/gui/widgets/label.hpp>
-#include <nana/gui/widgets/listbox.hpp>
-
-#include "inifile.h"
-#include "nana_subclassing.h"
-#include "tinyformat.h"
+#include <string>
+#include <vector>
+#include "resource.h"
 #include "util.h"
 
-using namespace std;
-using namespace nana;
-
 namespace fs = std::filesystem;
+constexpr wchar_t title[] = L"Borderless Window Helper";
+constexpr UINT trayMessage = WM_APP + 1;
+enum { monitoredId = 100, runningId, showId = 2000, startupId, menuId, exitId };
+struct Less { bool operator()(const std::wstring& a, const std::wstring& b) const { return _wcsicmp(a.c_str(), b.c_str()) < 0; } };
+struct Window { HWND handle; DWORD pid; fs::path path; std::wstring caption; HMONITOR monitor; bool borderless; };
+struct Monitored { fs::path path; HWND observed = nullptr, modified = nullptr; LONG_PTR style = 0, exstyle = 0; bool active = false; };
+static HINSTANCE instance;
+static HWND mainWindow, leftList, rightList, leftTitle, rightTitle, details;
+static HIMAGELIST images;
+static HICON icon;
+static fs::path config;
+static std::map<std::wstring, Window, Less> windows;
+static std::map<std::wstring, Monitored, Less> monitored;
+static std::map<std::wstring, int, Less> imageIndex;
+static bool updatingLists;
 
-fs::path inifile;
-HWND hwnd;
-
-void display_info(listbox &list1, listbox &list2, label &info);
-
-struct processNameComp
-{
-    bool operator()(const std::string &s1, const std::string &s2) const
-    {
-        return ::_stricmp(s1.c_str(), s2.c_str()) < 0;
+static std::string utf8(const std::wstring& value) {
+    if (value.empty()) return {};
+    int n = WideCharToMultiByte(CP_UTF8, 0, value.data(), (int)value.size(), nullptr, 0, nullptr, nullptr);
+    std::string result(n, 0);
+    WideCharToMultiByte(CP_UTF8, 0, value.data(), (int)value.size(), result.data(), n, nullptr, nullptr);
+    return result;
+}
+static std::wstring wide(const std::string& value) {
+    if (value.empty()) return {};
+    int n = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, value.data(), (int)value.size(), nullptr, 0);
+    UINT cp = CP_UTF8;
+    if (!n) { cp = CP_ACP; n = MultiByteToWideChar(cp, 0, value.data(), (int)value.size(), nullptr, 0); }
+    std::wstring result(n, 0);
+    MultiByteToWideChar(cp, 0, value.data(), (int)value.size(), result.data(), n);
+    return result;
+}
+struct IniEntry { std::string path; };
+static int parseEntry(void* context, const char* section, const char* key, const char* value) {
+    char* end;
+    long index = strtol(section, &end, 10);
+    if (*section && !*end && index >= 0 && index < 100000 && !strcmp(key, "p"))
+        (*static_cast<std::map<int, IniEntry>*>(context))[(int)index].path = value;
+    return 1;
+}
+static void load() {
+    FILE* file = _wfopen(config.c_str(), L"rb");
+    if (!file) return;
+    std::map<int, IniEntry> entries;
+    int result = ini_parse_file(file, parseEntry, &entries);
+    fclose(file);
+    if (result) return;
+    for (const auto& [number, entry] : entries) {
+        if (entry.path.empty()) continue;
+        fs::path path(wide(entry.path));
+        std::wstring name = path.filename().wstring();
+        if (name.empty()) continue;
+        Monitored item;
+        if (path.has_parent_path() && fs::exists(path)) item.path = path;
+        monitored[name] = item;
     }
-};
-
-map<string, monwin, processNameComp> monwins;
-
-map<string, enumwin, processNameComp> windows;
-
-int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int)
-{
-#ifdef _DEBUG
-    AllocConsole();
-    freopen("conout$", "w", stdout);
-#endif
-
-    int argc;
-    LPWSTR *argv = ::CommandLineToArgvW(GetCommandLineW(), &argc);
-    ::LocalFree(argv);
-
-    inifile = AppPath().parent_path() / L"bwh.ini";
-    if (!fs::exists(inifile))
-        inifile = GetSysFolderLocation(CSIDL_APPDATA) / L"Borderless-Window-Helper\\bwh.ini";
-
-    ::CreateMutexW(NULL, FALSE, TITLEW);
-    if (::GetLastError() == ERROR_ALREADY_EXISTS)
-    {
-        ::MessageBoxW(NULL, L"An instance of the program is already running! Press OK to exit.", TITLEW,
-                      MB_ICONEXCLAMATION);
+}
+static void save() {
+    std::error_code error;
+    fs::create_directories(config.parent_path(), error);
+    fs::path temp = config;
+    temp += L".tmp";
+    FILE* file = _wfopen(temp.c_str(), L"wb");
+    if (!file) return;
+    int i = 0;
+    for (const auto& [name, item] : monitored) {
+        std::string path = utf8(item.path.empty() ? name : item.path.wstring());
+        fprintf(file, "[%d]\np = %s\ns = 0x%llx\nexstyle = 0x%llx\n\n", i++, path.c_str(),
+                (unsigned long long)item.style, (unsigned long long)item.exstyle);
+    }
+    if (!fclose(file)) {
+        if (!MoveFileExW(temp.c_str(), config.c_str(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+            DeleteFileW(temp.c_str());
+    } else DeleteFileW(temp.c_str());
+}
+static BOOL CALLBACK collect(HWND handle, LPARAM) {
+    if (!IsWindowVisible(handle) || GetWindow(handle, GW_OWNER) || handle == mainWindow) return TRUE;
+    std::wstring caption = GetWindowTextString(handle);
+    if (caption.empty() || caption == L"Program Manager") return TRUE;
+    DWORD pid;
+    GetWindowThreadProcessId(handle, &pid);
+    HANDLE process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, FALSE, pid);
+    if (!process) return TRUE;
+    std::wstring pathText(32768, 0);
+    DWORD size = (DWORD)pathText.size();
+    BOOL ok = QueryFullProcessImageNameW(process, 0, pathText.data(), &size);
+    CloseHandle(process);
+    if (!ok) return TRUE;
+    pathText.resize(size);
+    fs::path path(pathText);
+    if (path == AppPath()) return TRUE;
+    std::wstring name = path.filename().wstring();
+    if (windows.find(name) != windows.end()) return TRUE;
+    LONG_PTR style = GetWindowLongPtrW(handle, GWL_STYLE);
+    windows.emplace(name, Window{handle, pid, path, caption, MonitorFromWindow(handle, MONITOR_DEFAULTTONEAREST),
+                                 !(style & (WS_CAPTION | WS_THICKFRAME))});
+    return TRUE;
+}
+static void enumerate() { windows.clear(); EnumWindows(collect, 0); }
+static void monitor() {
+    HWND foreground = GetForegroundWindow();
+    for (auto& [name, item] : monitored) {
+        auto it = windows.find(name);
+        if (it == windows.end()) { item.observed = nullptr; item.modified = nullptr; item.active = false; continue; }
+        Window& win = it->second;
+        if (item.observed != win.handle) {
+            item.observed = win.handle;
+            item.modified = nullptr;
+            item.active = foreground == win.handle;
+            if (!win.borderless) {
+                item.style = GetWindowLongPtrW(win.handle, GWL_STYLE);
+                item.exstyle = GetWindowLongPtrW(win.handle, GWL_EXSTYLE);
+                MONITORINFO monitorInfo{sizeof(monitorInfo)};
+                if (GetMonitorInfoW(win.monitor, &monitorInfo)) {
+                    SetWindowLongPtrW(win.handle, GWL_STYLE, (item.style & ~(WS_CAPTION | WS_THICKFRAME)) | WS_POPUP);
+                    SetWindowLongPtrW(win.handle, GWL_EXSTYLE, item.exstyle & ~(WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE));
+                    RECT r = monitorInfo.rcMonitor;
+                    SetWindowPos(win.handle, HWND_TOP, r.left, r.top, r.right-r.left, r.bottom-r.top,
+                                 SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+                    item.modified = win.handle;
+                    win.borderless = true;
+                }
+            }
+        }
+        if (foreground == win.handle) item.active = true;
+        else if (item.active && foreground && win.monitor == MonitorFromWindow(foreground, MONITOR_DEFAULTTONEAREST)) {
+            std::wstring className = GetClassNameString(foreground);
+            if (className != L"TaskSwitcherWnd" && className != L"Ghost") {
+                item.active = false;
+                if (!IsIconic(win.handle)) PostMessageW(win.handle, WM_SYSCOMMAND, SC_MINIMIZE, 0);
+            }
+        }
+    }
+}
+static int imageFor(const fs::path& path) {
+    if (path.empty()) return -1;
+    auto found = imageIndex.find(path.wstring());
+    if (found != imageIndex.end()) return found->second;
+    SHFILEINFOW info{};
+    if (!SHGetFileInfoW(path.c_str(), 0, &info, sizeof(info), SHGFI_ICON | SHGFI_SMALLICON)) return -1;
+    int index = ImageList_AddIcon(images, info.hIcon);
+    DestroyIcon(info.hIcon);
+    imageIndex[path.wstring()] = index;
+    return index;
+}
+static std::wstring selected(HWND list) {
+    int row = ListView_GetNextItem(list, -1, LVNI_SELECTED);
+    if (row < 0) return {};
+    wchar_t text[MAX_PATH]{};
+    ListView_GetItemText(list, row, 0, text, MAX_PATH);
+    return text;
+}
+static void populate(HWND list, bool isMonitored) {
+    updatingLists = true;
+    std::wstring selection = selected(list);
+    ListView_DeleteAllItems(list);
+    int row = 0;
+    if (isMonitored) {
+        for (const auto& [name, item] : monitored) {
+            LVITEMW entry{LVIF_TEXT | LVIF_IMAGE};
+            entry.iItem = row++; entry.pszText = const_cast<wchar_t*>(name.c_str()); entry.iImage = imageFor(item.path);
+            ListView_InsertItem(list, &entry);
+        }
+    } else {
+        for (const auto& [name, item] : windows) {
+            LVITEMW entry{LVIF_TEXT | LVIF_IMAGE};
+            entry.iItem = row++; entry.pszText = const_cast<wchar_t*>(name.c_str()); entry.iImage = imageFor(item.path);
+            ListView_InsertItem(list, &entry);
+        }
+    }
+    if (!selection.empty()) {
+        LVFINDINFOW find{LVFI_STRING}; find.psz = selection.c_str();
+        int index = ListView_FindItem(list, -1, &find);
+        if (index >= 0) ListView_SetItemState(list, index, LVIS_SELECTED | LVIS_FOCUSED, LVIS_SELECTED | LVIS_FOCUSED);
+    }
+    updatingLists = false;
+}
+static void showDetails() {
+    std::wstring name = selected(rightList);
+    auto running = windows.find(name);
+    if (running != windows.end()) {
+        const Window& win = running->second;
+        wchar_t line[160];
+        swprintf(line, 160, L"PID: %lu | Window handle: %p | Window %s\r\n\r\n", win.pid, win.handle,
+                 win.borderless ? L"is borderless" : L"has a border");
+        SetWindowTextW(details, (std::wstring(line) + L"Window title: " + win.caption).c_str());
+        return;
+    }
+    name = selected(leftList);
+    auto item = monitored.find(name);
+    if (item != monitored.end()) {
+        std::wstring text = windows.count(name) ? L"The process is running and being monitored." : L"The process is not running.";
+        if (!item->second.path.empty()) text += L"\r\n\r\n" + item->second.path.wstring();
+        SetWindowTextW(details, text.c_str());
+        return;
+    }
+    SetWindowTextW(details, L"Select a process to see details.\r\nDouble-click a running process to monitor it.\r\nDouble-click a monitored process or press Delete to remove it.");
+}
+static void refresh() {
+    enumerate(); monitor();
+    if (IsWindowVisible(mainWindow)) { populate(leftList, true); populate(rightList, false); showDetails(); }
+}
+static void addSelected() {
+    std::wstring name = selected(rightList);
+    auto found = windows.find(name);
+    if (found == windows.end() || monitored.count(name)) return;
+    Monitored item; item.path = found->second.path;
+    monitored[name] = item;
+    monitor(); populate(leftList, true); showDetails(); save();
+}
+static void removeSelected() {
+    std::vector<std::wstring> names;
+    for (int row = -1; (row = ListView_GetNextItem(leftList, row, LVNI_SELECTED)) >= 0;) {
+        wchar_t text[MAX_PATH]{}; ListView_GetItemText(leftList, row, 0, text, MAX_PATH); names.emplace_back(text);
+    }
+    for (const auto& name : names) {
+        auto found = monitored.find(name);
+        if (found == monitored.end()) continue;
+        Monitored& item = found->second;
+        if (item.modified && IsWindow(item.modified) && windows.count(name) && windows.at(name).handle == item.modified) {
+            SetWindowLongPtrW(item.modified, GWL_STYLE, item.style);
+            SetWindowLongPtrW(item.modified, GWL_EXSTYLE, item.exstyle);
+            SetWindowPos(item.modified, nullptr, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
+        }
+        monitored.erase(found);
+    }
+    if (!names.empty()) { populate(leftList, true); showDetails(); save(); }
+}
+static fs::path shortcut(bool startup) {
+    fs::path path = GetSysFolderLocation(CSIDL_APPDATA);
+    path /= L"Microsoft/Windows/Start Menu/Programs";
+    if (startup) path /= L"Startup";
+    return path / L"Borderless Window Helper.lnk";
+}
+static void toggleShortcut(bool startup) {
+    fs::path path = shortcut(startup);
+    if (fs::exists(path)) { std::error_code error; fs::remove(path, error); }
+    else createShortcut(path, AppPath(), L"tray", L"");
+}
+static void show() { ShowWindow(mainWindow, SW_SHOW); SetForegroundWindow(mainWindow); refresh(); }
+static void popup() {
+    HMENU menu = CreatePopupMenu();
+    AppendMenuW(menu, MF_STRING, showId, IsWindowVisible(mainWindow) ? L"Hide interface" : L"Show interface");
+    AppendMenuW(menu, MF_STRING | (fs::exists(shortcut(true)) ? MF_CHECKED : 0), startupId, L"Start with Windows");
+    AppendMenuW(menu, MF_STRING | (fs::exists(shortcut(false)) ? MF_CHECKED : 0), menuId, L"Start Menu");
+    AppendMenuW(menu, MF_SEPARATOR, 0, nullptr);
+    AppendMenuW(menu, MF_STRING, exitId, L"Exit");
+    POINT point; GetCursorPos(&point); SetForegroundWindow(mainWindow);
+    UINT choice = TrackPopupMenu(menu, TPM_RETURNCMD | TPM_RIGHTBUTTON, point.x, point.y, 0, mainWindow, nullptr);
+    DestroyMenu(menu); PostMessageW(mainWindow, WM_NULL, 0, 0);
+    if (choice == showId) { if (IsWindowVisible(mainWindow)) ShowWindow(mainWindow, SW_HIDE); else show(); }
+    else if (choice == startupId) toggleShortcut(true);
+    else if (choice == menuId) toggleShortcut(false);
+    else if (choice == exitId) DestroyWindow(mainWindow);
+}
+static void layout(int width, int height) {
+    if (!leftList) return;
+    int column = (width - 45) / 2;
+    int listHeight = height - 155;
+    MoveWindow(leftTitle, 15, 15, column, 20, TRUE);
+    MoveWindow(rightTitle, column + 30, 15, column, 20, TRUE);
+    MoveWindow(leftList, 15, 35, column, listHeight, TRUE);
+    MoveWindow(rightList, column + 30, 35, column, listHeight, TRUE);
+    MoveWindow(details, 15, listHeight + 50, width - 30, 90, TRUE);
+    ListView_SetColumnWidth(leftList, 0, column - 5);
+    ListView_SetColumnWidth(rightList, 0, column - 5);
+    RedrawWindow(leftTitle, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+    RedrawWindow(rightTitle, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_UPDATENOW);
+}
+static HWND makeList(int id) {
+    HWND list = CreateWindowExW(WS_EX_CLIENTEDGE, WC_LISTVIEWW, L"",
+        WS_CHILD | WS_VISIBLE | WS_TABSTOP | LVS_REPORT | LVS_NOCOLUMNHEADER | LVS_SHOWSELALWAYS,
+        0, 0, 100, 100, mainWindow, (HMENU)(INT_PTR)id, instance, nullptr);
+    ListView_SetExtendedListViewStyle(list, LVS_EX_FULLROWSELECT | LVS_EX_DOUBLEBUFFER);
+    ListView_SetImageList(list, images, LVSIL_SMALL);
+    LVCOLUMNW column{LVCF_WIDTH}; column.cx = 100; ListView_InsertColumn(list, 0, &column);
+    return list;
+}
+static LRESULT CALLBACK windowProc(HWND handle, UINT message, WPARAM wparam, LPARAM lparam) {
+    switch (message) {
+    case WM_CREATE: {
+        mainWindow = handle;
+        images = ImageList_Create(16, 16, ILC_COLOR32 | ILC_MASK, 16, 16);
+        leftTitle = CreateWindowW(L"STATIC", L"Processes with windows being monitored:", WS_CHILD | WS_VISIBLE,
+                                  0, 0, 0, 0, handle, nullptr, instance, nullptr);
+        rightTitle = CreateWindowW(L"STATIC", L"Processes currently running with visible windows:", WS_CHILD | WS_VISIBLE,
+                                   0, 0, 0, 0, handle, nullptr, instance, nullptr);
+        leftList = makeList(monitoredId); rightList = makeList(runningId);
+        details = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE,
+                                0, 0, 0, 0, handle, nullptr, instance, nullptr);
+        NONCLIENTMETRICSW metrics{sizeof(metrics)};
+        if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0)) {
+            HFONT font = CreateFontIndirectW(&metrics.lfMessageFont);
+            for (HWND control : {leftTitle, rightTitle, leftList, rightList, details})
+                SendMessageW(control, WM_SETFONT, (WPARAM)font, TRUE);
+            SetPropW(handle, L"BWH.Font", font);
+        }
+        NOTIFYICONDATAW tray{sizeof(tray)};
+        tray.hWnd = handle; tray.uID = 1; tray.uFlags = NIF_ICON | NIF_MESSAGE | NIF_TIP;
+        tray.hIcon = icon; tray.uCallbackMessage = trayMessage; wcscpy_s(tray.szTip, title);
+        Shell_NotifyIconW(NIM_ADD, &tray);
+        SetTimer(handle, 1, 1000, nullptr);
+        refresh();
         return 0;
     }
-
-    ::CoInitialize(NULL);
-    LoadSettings();
-    RunGUI(argc == 1);
-    SaveSettings();
-    ::CoUninitialize();
-    return 0;
-}
-
-enum MENUIDS
-{
-    IDSHOW = 2000,
-    IDAUTOSTART,
-    IDSTARTMENU,
-    IDEXIT
-};
-
-void RunGUI(bool show)
-{
-    form fm(API::make_center(640, 480), appear::decorate<appear::minimize, appear::sizable>());
-    fm.bgcolor(colors::white);
-    fm.caption(TITLE);
-    fm.icon(paint::image(AppPath()));
-
-    hwnd = (HWND)fm.native_handle();
-
-    notifier ntfr(fm);
-    ntfr.text(TITLE);
-    ntfr.icon(AppPath().string());
-    ntfr.events().dbl_click([&fm] {
-        if (fm.visible())
-            fm.hide();
-        else
-        {
-            fm.show();
-            ::SetForegroundWindow(hwnd);
-        }
-    });
-    ntfr.events().mouse_up([&fm](const arg_mouse &e) {
-        if (e.right_button)
-        {
-            static fs::path stlink = GetSysFolderLocation(CSIDL_APPDATA) /
-                                     L"microsoft\\windows\\start menu\\programs\\startup\\Borderless Window Helper.lnk";
-            static fs::path menu_link = GetSysFolderLocation(CSIDL_APPDATA) /
-                                        L"microsoft\\windows\\start menu\\programs\\Borderless Window Helper.lnk";
-            HMENU hpop = ::CreatePopupMenu();
-            POINT pt;
-            ::GetCursorPos(&pt);
-            int pos = 0;
-            ::InsertMenuW(hpop, pos++, MF_BYPOSITION | MF_STRING, IDSHOW,
-                          fm.visible() ? L"Hide interface" : L"Show interface");
-            ::InsertMenuW(hpop, pos++, MF_BYPOSITION | MF_STRING | (fs::exists(stlink) ? MF_CHECKED : MF_UNCHECKED),
-                          IDAUTOSTART, L"Start with Windows");
-            ::InsertMenuW(hpop, pos++, MF_BYPOSITION | MF_STRING | (fs::exists(menu_link) ? MF_CHECKED : MF_UNCHECKED),
-                          IDSTARTMENU, L"Start Menu");
-            ::InsertMenuW(hpop, pos++, MF_BYPOSITION | MF_STRING, IDEXIT, L"Exit");
-            ::SetForegroundWindow(hwnd);
-            WORD cmd = ::TrackPopupMenu(hpop, TPM_LEFTALIGN | TPM_RIGHTBUTTON | TPM_RETURNCMD | TPM_NONOTIFY, pt.x,
-                                        pt.y, 0, hwnd, NULL);
-            ::DestroyMenu(hpop);
-            if (cmd == IDSHOW)
-            {
-                if (fm.visible())
-                    fm.hide();
-                else
-                    fm.show();
-            }
-            else if (cmd == IDAUTOSTART)
-            {
-                if (fs::exists(stlink))
-                    fs::remove(stlink);
-                else
-                    createShortcut(stlink, AppPath(), L"tray", L"");
-            }
-            else if (cmd == IDSTARTMENU)
-            {
-                if (fs::exists(menu_link))
-                    fs::remove(menu_link);
-                else
-                    createShortcut(menu_link, AppPath(), L"tray", L"");
-            }
-            else if (cmd == IDEXIT)
-                API::exit();
-        }
-    });
-
-    subclass sc(fm);
-    sc.make_before(WM_SYSCOMMAND, [&fm](UINT, WPARAM wparam, LPARAM, LRESULT *) {
-        if (wparam == SC_CLOSE)
-        {
-            API::exit();
-            return false;
-        }
-        if (wparam == SC_MINIMIZE)
-        {
-            fm.hide();
-            return false;
-        }
-        return true;
-    });
-
-    sc.make_before(WM_KEYUP, [&fm](UINT, WPARAM wparam, LPARAM, LRESULT *) {
-        if (wparam == VK_ESCAPE)
-        {
-            fm.hide();
-            return false;
-        }
-        return true;
-    });
-
-    sc.make_before(WM_ENDSESSION, [](UINT, WPARAM wparam, LPARAM, LRESULT *) {
-        if (wparam == TRUE)
-            SaveSettings();
-        return true;
-    });
-
-    auto plc = place(fm);
-    plc.div(R"(<form margin=15 vertical arrange=86
-                 <<monitored vertical arrange = [ 15, variable ] margin = [ 0, 7, 0, 0 ]>
-                   <running  vertical arrange = [ 15, variable ] margin = [ 0, 0, 0, 8 ]>>
-                 <weight = 15>>)");
-
-    const int padding = 15;
-
-    label lb1(fm);
-    lb1.fgcolor(color_rgb(0x555555));
-    lb1.caption("Processes with windows being monitored:");
-
-    auto itemComparator = [](const std::string &s1, std::any *, const std::string &s2, std::any *, bool reverse) {
-        int res = ::_stricmp(s1.c_str(), s2.c_str());
-        return reverse ? res > 0 : res < 0;
-    };
-
-    listbox list1(fm);
-    list1.bgcolor(color_rgb(0xfbfbfb));
-    list1.fgcolor(color_rgb(0x909090));
-    list1.show_header(false);
-    list1.append_header("Process Name");
-    list1.scheme().item_selected = color_rgb(0xdcefe8);
-    list1.scheme().item_highlighted = color_rgb(0xeaf0ef);
-    list1.set_sort_compare(0, itemComparator);
-
-    plc.field("monitored") << lb1 << list1;
-
-    listbox list2(fm);
-    list2.bgcolor(color_rgb(0xfbfbfb));
-    list2.fgcolor(color_rgb(0x111111));
-    list2.show_header(false);
-    list2.enable_single(true, false);
-    list2.append_header("Process Name");
-    list2.scheme().item_selected = color_rgb(0xdcefe8);
-    list2.scheme().item_highlighted = color_rgb(0xeaf0ef);
-    list2.set_sort_compare(0, itemComparator);
-
-    label lb2(fm);
-    lb2.fgcolor(color_rgb(0x555555));
-    lb2.caption("Processes currently running that have visible windows:");
-
-    plc.field("running") << lb2 << list2;
-
-    group grp(fm);
-    grp.scheme().background = color_rgb(0xfbfbfb);
-    grp.div("<form margin=5>");
-
-    label lbinfo(grp);
-    lbinfo.bgcolor(color_rgb(0xfbfbfb));
-    lbinfo.fgcolor(color_rgb(0x555555));
-    lbinfo.format(true);
-
-    plc.field("form") << grp;
-    grp["form"] << lbinfo;
-
-    list2.events().dbl_click([&list1, &list2](const arg_mouse &arg) {
-        auto lb = list2.at(0);
-        auto selection = list2.selected();
-        if (selection.size() == 1)
-        {
-            string seltext;
-            seltext = lb.at(selection[0].item).text(0);
-            if (monwins.find(seltext) != monwins.end())
-                return;
-            const auto &win = windows.at(seltext);
-            LONG_PTR style = 0, exstyle = 0;
-            if (!win.borderless)
-            {
-                style = ::GetWindowLongPtrW(win.hwnd, GWL_STYLE);
-                exstyle = ::GetWindowLongPtrW(win.hwnd, GWL_EXSTYLE);
-            }
-            monwins[seltext] = {style, exstyle, false, seltext, win.modpath};
-            list1.auto_draw(false);
-            list1.at(0).push_back(seltext);
-            list1.at(0).back().icon(paint::image(win.modpath));
-            list1.auto_draw(true);
-            list1.column_at(0).fit_content();
-            mon_timer_fn();
-            // ::PostMessageW(win.hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
-            ::SetForegroundWindow(hwnd);
-            SaveSettings();
-        }
-    });
-
-    list2.events().selected([&list1, &list2, &lbinfo](const arg_listbox &arg) {
-        display_info(list1, list2, lbinfo);
-        auto lb = list2.at(0);
-        auto selection = list2.selected();
-        if (selection.size() == 1)
-        {
-            string seltext = lb.at(selection[0].item).text(0);
-            lbinfo.text_align(align::left);
-            lbinfo.typeface(paint::font("Segoe UI", 10, detail::font_style(0)));
-            auto it = windows.find(seltext);
-            if (it != windows.end())
-            {
-                const auto &win = it->second;
-                const char *border;
-                if (win.borderless)
-                {
-                    auto it = monwins.find(seltext);
-                    if (it != monwins.end() && it->second.style != 0)
-                        border = "border has been removed";
-                    else
-                        border = "doesn't have a border";
-                }
-                else
-                    border = "has a border (monitoring will remove it)";
-                const char *cap =
-                    R"(<font="Segoe UI Semibold">PID:</> %d | <font="Segoe UI Semibold">Window handle:</> %x | Window %s
-
-<font="Segoe UI Semibold">Window title:</> %s)";
-                lbinfo.caption(tfm::format(cap, win.procid, win.hwnd, border, escape(win.captionw)));
-            }
-            else
-            {
-                lbinfo.caption("Unexpected error - can't find window!");
-            }
-        }
-    });
-
-    list1.events().selected([&list1, &list2, &lbinfo](const arg_listbox &arg) {
-        display_info(list1, list2, lbinfo);
-        auto lb = list1.at(0);
-        auto selection = list1.selected();
-        if (selection.size() == 1)
-        {
-            string seltext = lb.at(selection[0].item).text(0);
-            lbinfo.text_align(align::center, align_v::center);
-            lbinfo.typeface(paint::font("Segoe UI", 10, detail::font_style(0, true)));
-            std::stringstream caption;
-            const auto &monwin = monwins.at(seltext);
-            if (windows.find(seltext) == windows.end())
-            {
-                caption << "The process is not currently running.";
-                if (monwin.style != 0)
-                    caption << " Its window has a border, which will be removed when it is run.";
-            }
-            if (caption.str().empty())
-            {
-                caption << "The process is currently running. Its window is being monitored.";
-                if (monwin.style != 0)
-                    caption << " The border has been removed, and the window has been resized to fill the screen.";
-            }
-            string modpath = monwin.modpath.string();
-            if (!modpath.empty())
-            {
-                if (monwin.style != 0)
-                    caption << "\n";
-                caption << "\n<color=0x117011>" << modpath << "</>";
-            }
-            lbinfo.caption(caption.str());
-        }
-    });
-
-    auto remove_monitored_processes = [&list1]() {
-        auto lb = list1.at(0);
-        auto selection = list1.selected();
-        for (auto &selitem : selection)
-        {
-            string seltext = lb.at(selitem.item).text(0);
-            auto it = windows.find(seltext);
-            if (it != windows.end())
-            {
-                const enumwin &win = it->second;
-                const auto &monwin = monwins.at(seltext);
-                if (monwin.style != 0)
-                    ::SetWindowLongPtrW(win.hwnd, GWL_STYLE, monwin.style);
-                if (monwin.exstyle != 0)
-                    ::SetWindowLongPtrW(win.hwnd, GWL_EXSTYLE, monwin.exstyle);
-            }
-            monwins.erase(seltext);
-        }
-        list1.erase(selection);
-        list1.column_at(0).fit_content();
-        SaveSettings();
-    };
-
-    list1.events().key_release([&remove_monitored_processes](const arg_keyboard &arg) {
-        if (arg.key == 0x7f) // DEL ASCII code
-            remove_monitored_processes();
-    });
-
-    list1.events().dbl_click([&remove_monitored_processes](const arg_mouse &arg) { remove_monitored_processes(); });
-
-    timer enum_timer;
-    enum_timer.interval(1000ms);
-    enum_timer.elapse([&list1, &list2, &lbinfo] { enum_timer_fn(list1, list2); });
-    enum_timer.start();
-    enum_timer_fn(list1, list2);
-
-    timer mon_timer;
-    mon_timer.interval(1000ms);
-    mon_timer.elapse(mon_timer_fn);
-    mon_timer.start();
-
-    list1.auto_draw(false);
-    for (auto &[procname, monwin] : monwins)
-    {
-        list1.at(0).push_back(monwin.pname);
-        list1.at(0).back().icon(paint::image(monwin.modpath));
+    case WM_SIZE: layout(LOWORD(lparam), HIWORD(lparam)); return 0;
+    case WM_CTLCOLORSTATIC: {
+        HDC dc = (HDC)wparam;
+        SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
+        SetBkColor(dc, GetSysColor(COLOR_WINDOW));
+        SetBkMode(dc, OPAQUE);
+        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
     }
-    list1.auto_draw(true);
-    list1.column_at(0).fit_content();
-    display_info(list1, list2, lbinfo);
-
-    plc.collocate();
-    if (show)
-        fm.show();
-    nana::exec();
-    ntfr.close();
-}
-
-// monitors windows from list1 and minimizes them, removing borders if any
-void mon_timer_fn()
-{
-    for (auto &[procname, monwin] : monwins)
-    {
-        auto it = windows.find(monwin.pname);
-        if (it == windows.end())
-            continue; // process not running
-        enumwin &win = it->second;
-        if (!win.borderless) // remove borders
-        {
-            MONITORINFO mi = {sizeof(mi)};
-            ::GetMonitorInfoW(win.monitor, &mi);
-            // TODO: store style and exstyle in win?
-            ::SetWindowLongPtrW(win.hwnd, GWL_STYLE, (monwin.style & ~(WS_CAPTION | WS_THICKFRAME)) | WS_POPUP);
-            ::SetWindowLongPtrW(win.hwnd, GWL_EXSTYLE, monwin.exstyle & ~(WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE));
-            ::SetWindowPos(win.hwnd, HWND_TOP, mi.rcMonitor.left, mi.rcMonitor.top,
-                           mi.rcMonitor.right - mi.rcMonitor.left, mi.rcMonitor.bottom - mi.rcMonitor.top,
-                           SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-            win.borderless = true;
-        }
-        HWND fghwnd = ::GetForegroundWindow();
-        if (monwin.active)
-        {
-            if (fghwnd != win.hwnd && win.monitor == ::MonitorFromWindow(fghwnd, MONITOR_DEFAULTTOPRIMARY))
-            {
-                wstring fgclassname = GetClassNameString(fghwnd);
-                if (fgclassname != L"TaskSwitcherWnd" && fgclassname != L"Ghost")
-                {
-                    monwin.active = false;
-                    // ::PostMessageW(win.hwnd, WM_SYSCOMMAND, SC_MINIMIZE, 0);
-                }
+    case WM_TIMER: if (wparam == 1) refresh(); return 0;
+    case WM_NOTIFY: {
+        auto* event = (NMHDR*)lparam;
+        if (event->code == NM_DBLCLK) {
+            if (event->idFrom == runningId) addSelected();
+            else if (event->idFrom == monitoredId) removeSelected();
+        } else if (event->code == LVN_ITEMCHANGED && !updatingLists) {
+            auto* changed = (NMLISTVIEW*)lparam;
+            if ((changed->uChanged & LVIF_STATE) && (changed->uNewState & LVIS_SELECTED) &&
+                !(changed->uOldState & LVIS_SELECTED)) {
+                HWND other = event->idFrom == monitoredId ? rightList : leftList;
+                if (other) ListView_SetItemState(other, -1, 0, LVIS_SELECTED);
             }
+            showDetails();
         }
-        else if (fghwnd == win.hwnd)
-            monwin.active = true;
+        else if (event->code == LVN_KEYDOWN && event->idFrom == monitoredId &&
+                 ((NMLVKEYDOWN*)lparam)->wVKey == VK_DELETE) removeSelected();
+        return 0;
     }
-}
-
-void display_info(listbox &list1, listbox &list2, label &info)
-{
-    auto selection1 = list1.selected(), selection2 = list2.selected();
-    if (selection2.empty() && selection1.empty())
-    {
-        info.text_align(align::center, align_v::center);
-        info.typeface(paint::font("Segoe UI", 10, detail::font_style(0, true)));
-        info.caption(R"(<color=0x666666>Select a process in the lists above to see some info about it here.
-Double-click a process in the right list to start monitoring its window.
-Select one or more processes in the left list and press the "Delete" key to remove them.)");
-    }
-}
-
-// updates list2 from current data
-void enum_timer_fn(listbox &list1, listbox &list2)
-{
-    enum_windows();
-    auto lb1 = list1.at(0), lb2 = list2.at(0);
-    list2.auto_draw(false);
-    for (auto &item : lb2) // remove from list2 processes no longer running
-    {
-        if (windows.find(item.text(0)) == windows.end())
-            list2.erase(item);
-    }
-    // add to list2 running processes that are not already in the list
-    for (const auto &entry : windows)
-    {
-        auto procname = entry.first;
-        const auto &win = entry.second;
-        auto found =
-            std::find_if(lb2.begin(), lb2.end(), [&](auto &item) { return item.text(0) == procname; }) != lb2.end();
-        if (!found)
-        {
-            lb2.push_back(procname);
-            lb2.back().icon(paint::image(win.modpath));
+    case WM_KEYUP: if (wparam == VK_ESCAPE) ShowWindow(handle, SW_HIDE); return 0;
+    case WM_SYSCOMMAND:
+        if ((wparam & 0xfff0) == SC_CLOSE || (wparam & 0xfff0) == SC_MINIMIZE) {
+            ShowWindow(handle, SW_HIDE); return 0;
         }
+        break;
+    case trayMessage:
+        if (lparam == WM_LBUTTONDBLCLK) {
+            if (IsWindowVisible(handle)) ShowWindow(handle, SW_HIDE); else show();
+        } else if (lparam == WM_RBUTTONUP || lparam == WM_CONTEXTMENU) popup();
+        return 0;
+    case WM_ENDSESSION: if (wparam) save(); return 0;
+    case WM_DESTROY: {
+        KillTimer(handle, 1); save();
+        NOTIFYICONDATAW tray{sizeof(tray)}; tray.hWnd = handle; tray.uID = 1;
+        Shell_NotifyIconW(NIM_DELETE, &tray);
+        ImageList_Destroy(images);
+        if (HANDLE font = GetPropW(handle, L"BWH.Font")) DeleteObject(font);
+        PostQuitMessage(0); return 0;
     }
-
-    for (auto &item : list2.at(0))
-    {
-        if (windows.at(item.text(0)).borderless)
-            item.fgcolor(color_rgb(0x883311));
-        else
-            item.fgcolor(list2.fgcolor());
     }
-    list2.auto_draw(true);
-    list2.column_at(0).fit_content();
-    if (::IsWindowVisible(hwnd) && !::IsIconic(hwnd))
-    {
-        list1.auto_draw(false);
-        for (auto &item : list1.at(0))
-        {
-            if (windows.find(item.text(0)) == windows.end())
-            {
-                item.fgcolor(list1.fgcolor());
-                item.bgcolor(list1.bgcolor());
-            }
-            else
-            {
-                item.fgcolor(color_rgb(0x663311));
-                item.bgcolor(color_rgb(0xffffff));
-            }
-        }
-        list1.auto_draw(true);
+    return DefWindowProcW(handle, message, wparam, lparam);
+}
+int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE, LPWSTR args, int showCommand) {
+    instance = hinstance;
+    HANDLE mutex = CreateMutexW(nullptr, FALSE, title);
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        MessageBoxW(nullptr, L"An instance of the program is already running.", title, MB_ICONINFORMATION);
+        if (mutex) CloseHandle(mutex);
+        return 0;
     }
-}
-
-void enum_windows()
-{
-    WNDENUMPROC enumfn = [](HWND hwnd, LPARAM lparam) -> BOOL {
-        auto style = ::GetWindowLongPtrW(hwnd, GWL_STYLE);
-        wstring caption = ::GetWindowTextString(hwnd);
-        if ((style & WS_VISIBLE) && !caption.empty() && caption != L"Program Manager")
-        {
-            DWORD procid = 0;
-            ::GetWindowThreadProcessId(hwnd, &procid);
-            HANDLE hproc = ::OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, procid);
-            if (hproc != NULL)
-            {
-                auto procpath = GetModuleFileNameExPath(hproc);
-                ::CloseHandle(hproc);
-                if (procpath != AppPath())
-                {
-                    enumwin win;
-                    win.procid = procid;
-                    win.pname = procpath.filename().string();
-                    win.hwnd = hwnd;
-                    win.monitor = ::MonitorFromWindow(hwnd, MONITOR_DEFAULTTOPRIMARY);
-                    win.captionw = caption;
-                    if (!(style & (WS_CAPTION | WS_THICKFRAME)))
-                        win.borderless = true;
-                    string key = procpath.filename().string();
-                    win.modpath = procpath;
-                    windows[key] = win;
-                }
-            }
-        }
-        return TRUE;
-    };
-
-    windows.clear();
-    ::EnumWindows(enumfn, 0);
-}
-
-void LoadSettings()
-{
-    IniFile ini(inifile);
-    monwins.clear();
-    int n = 0;
-    LONG_PTR style = 0, exstyle = 0;
-    string pname;
-    do
-    {
-        pname = ini.ReadString(to_string(n), "p", "");
-        if (!pname.empty())
-        {
-            style = ini.ReadLongLong(to_string(n), "s", 0);
-            exstyle = ini.ReadLongLong(to_string(n), "exstyle", 0);
-            if (pname.find('\\') != string::npos)
-            {
-                fs::path p(pname);
-                string key = p.filename().string();
-                if (fs::exists(p))
-                    monwins[key] = {style, exstyle, false, p.filename().string(), p};
-                else
-                    monwins[key] = {style, exstyle, false, p.filename().string()};
-            }
-            else
-                monwins[pname] = {style, exstyle, false, pname};
-        }
-        n++;
-    } while (!pname.empty());
-}
-
-template <typename t> std::string to_hex_string(t i)
-{
-    std::stringstream ss;
-    ss << std::hex << "0x" << i;
-    return ss.str();
-}
-
-void SaveSettings()
-{
-    fs::remove(inifile);
-    IniFile ini(inifile);
-    int idx = 0;
-    for (auto &[procname, monwin] : monwins)
-    {
-        string s = to_string(idx++);
-        const fs::path &modpath = monwin.modpath;
-        ini.WriteString(s, "p", modpath.empty() ? monwin.pname : modpath.string());
-        ini.WriteString(s, "s", to_hex_string(monwin.style));
-        ini.WriteString(s, "exstyle", to_hex_string(monwin.exstyle));
-    }
-}
-
-std::ostream &operator<<(std::ostream &os, const std::wstring &s)
-{
-    os << charset(s).to_bytes(unicode::utf8);
-    return os;
+    CoInitialize(nullptr);
+    config = AppPath().parent_path() / L"bwh.ini";
+    if (!fs::exists(config)) config = GetSysFolderLocation(CSIDL_APPDATA) / L"Borderless-Window-Helper/bwh.ini";
+    load();
+    INITCOMMONCONTROLSEX controls{sizeof(controls), ICC_LISTVIEW_CLASSES}; InitCommonControlsEx(&controls);
+    icon = LoadIconW(instance, MAKEINTRESOURCEW(IDI_ICON));
+    WNDCLASSEXW cls{sizeof(cls)};
+    cls.lpfnWndProc = windowProc; cls.hInstance = instance; cls.lpszClassName = title;
+    cls.hIcon = icon; cls.hIconSm = icon; cls.hCursor = LoadCursorW(nullptr, IDC_ARROW);
+    cls.hbrBackground = (HBRUSH)(COLOR_WINDOW + 1);
+    RegisterClassExW(&cls);
+    RECT rect{0, 0, 640, 480}; AdjustWindowRectEx(&rect, WS_OVERLAPPEDWINDOW, FALSE, 0);
+    HWND window = CreateWindowExW(0, title, title, WS_OVERLAPPEDWINDOW | WS_CLIPCHILDREN, CW_USEDEFAULT, CW_USEDEFAULT,
+        rect.right - rect.left, rect.bottom - rect.top, nullptr, nullptr, instance, nullptr);
+    if (!window) { CoUninitialize(); if (mutex) CloseHandle(mutex); return 1; }
+    if (!args || !*args) ShowWindow(window, showCommand);
+    MSG message{};
+    while (GetMessageW(&message, nullptr, 0, 0) > 0) { TranslateMessage(&message); DispatchMessageW(&message); }
+    CoUninitialize(); if (mutex) CloseHandle(mutex);
+    return (int)message.wParam;
 }

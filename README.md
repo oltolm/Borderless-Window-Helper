@@ -14,6 +14,17 @@ The interface is pretty straight-forward -- the list on the right shows you rele
 
 Pressing the "close" button only hides the interface, so if you want to close the program, right-click on the program's notification area icon and select "Exit" from the menu. And if you're going to use the program regularly, you'll probably want to run it automatically at system startup, which you can do by selecting "Start with Windows" from the same menu. FYI, that results in a .lnk file being placed in `%appdata%\microsoft\windows\start menu\programs\startup` (you can use `shell:startup` as a short alias for that path).
 
+## Build
+
+The application uses Win32 controls and [inih](https://github.com/benhoyt/inih) for settings. CMake uses the inih source at `C:/src/inih` by default; set `-DINIH_ROOT=...` if it is elsewhere. No Nana dependency is needed.
+
+```powershell
+cmake --preset gcc
+cmake --build build-gcc --parallel $env:NUMBER_OF_PROCESSORS
+```
+
+Settings remain in `bwh.ini` beside the executable when that file exists, otherwise in `%APPDATA%\Borderless-Window-Helper\bwh.ini`.
+
 ## Download
 [Borderless Window Helper 1.3.zip](https://github.com/ErrorFlynn/Borderless-Window-Helper/releases/download/v1.3/Borderless.Window.Helper.1.3.zip)
 

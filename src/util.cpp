@@ -1,7 +1,5 @@
 #include "util.h"
-#include <psapi.h>
 #include <shlobj.h>
-#include <sstream>
 #include <wrl.h>
 
 using namespace std;
@@ -15,22 +13,6 @@ std::filesystem::path AppPath()
     do
     {
         DWORD nRet = ::GetModuleFileNameW(NULL, &filename[0], filename.size());
-        if (nRet == 0)
-            return L"";
-        truncated = nRet == filename.size();
-        filename.resize(truncated ? filename.size() * 2 : nRet);
-    } while (truncated);
-    return filename;
-}
-
-std::filesystem::path GetModuleFileNameExPath(HANDLE hProcess)
-{
-    std::wstring filename;
-    filename.resize(MAX_PATH);
-    boolean truncated;
-    do
-    {
-        DWORD nRet = ::GetModuleFileNameExW(hProcess, NULL, &filename[0], filename.size());
         if (nRet == 0)
             return L"";
         truncated = nRet == filename.size();
@@ -95,17 +77,4 @@ std::wstring GetWindowTextString(HWND hWnd)
         return L"";
     caption.resize(nRet);
     return caption;
-}
-
-std::wstring escape(const std::wstring &s)
-{
-    std::wstringstream wss;
-    for (auto c : s)
-    {
-        if (c == '<' || c == '>' || c == '\\')
-            wss << "\\" << c;
-        else
-            wss << c;
-    }
-    return wss.str();
 }
