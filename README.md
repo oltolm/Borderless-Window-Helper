@@ -16,11 +16,11 @@ Pressing the "close" button only hides the interface, so if you want to close th
 
 ## Build
 
-The application uses Win32 controls and [inih](https://github.com/benhoyt/inih) for settings. CMake uses the inih source at `C:/src/inih` by default; set `-DINIH_ROOT=...` if it is elsewhere. No Nana dependency is needed.
+The application uses Win32 controls and [inih](https://github.com/benhoyt/inih) for settings. The inih source and license are included in `third_party/inih`, so the build does not need a separate inih checkout or a network download. The included inih files come from commit `611ab51f8dd7ec583543815b0de693495045fbf8`.
 
 ```powershell
-cmake --preset gcc
-cmake --build build-gcc --parallel $env:NUMBER_OF_PROCESSORS
+cmake -S . -B build
+cmake --build build --parallel $env:NUMBER_OF_PROCESSORS
 ```
 
 Settings remain in `bwh.ini` beside the executable when that file exists, otherwise in `%APPDATA%\Borderless-Window-Helper\bwh.ini`.

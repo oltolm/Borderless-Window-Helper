@@ -1,11 +1,15 @@
+#define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <commctrl.h>
 #include <shellapi.h>
 #include <shlobj.h>
+#include <dwmapi.h>
+#include <uxtheme.h>
 #include <ini.h>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <algorithm>
 #include <filesystem>
 #include <map>
 #include <string>
@@ -19,7 +23,20 @@ constexpr UINT trayMessage = WM_APP + 1;
 enum { monitoredId = 100, runningId, showId = 2000, startupId, menuId, exitId };
 struct Less { bool operator()(const std::wstring& a, const std::wstring& b) const { return _wcsicmp(a.c_str(), b.c_str()) < 0; } };
 struct Window { HWND handle; DWORD pid; fs::path path; std::wstring caption; HMONITOR monitor; bool borderless; };
-struct Monitored { fs::path path; HWND observed = nullptr, modified = nullptr; LONG_PTR style = 0, exstyle = 0; bool active = false; };
+struct WindowRestore {
+    HWND handle = nullptr;
+    DWORD pid = 0;
+    LONG_PTR style = 0, exstyle = 0;
+    WINDOWPLACEMENT placement{sizeof(WINDOWPLACEMENT)};
+    RECT originalRect{};
+};
+struct Monitored {
+    fs::path path;
+    HWND observed = nullptr;
+    LONG_PTR style = 0, exstyle = 0;
+    std::vector<WindowRestore> changedWindows;
+    bool active = false;
+};
 static HINSTANCE instance;
 static HWND mainWindow, leftList, rightList, leftTitle, rightTitle, details;
 static HIMAGELIST images;
@@ -29,6 +46,46 @@ static std::map<std::wstring, Window, Less> windows;
 static std::map<std::wstring, Monitored, Less> monitored;
 static std::map<std::wstring, int, Less> imageIndex;
 static bool updatingLists;
+static bool darkTheme, highContrast;
+static HBRUSH backgroundBrush;
+
+static COLORREF backgroundColor() {
+    return darkTheme ? RGB(32, 32, 32) : GetSysColor(COLOR_WINDOW);
+}
+static COLORREF textColor() {
+    return darkTheme ? RGB(235, 235, 235) : GetSysColor(COLOR_WINDOWTEXT);
+}
+static bool systemUsesDarkTheme() {
+    DWORD value = 1;
+    DWORD size = sizeof(value);
+    if (RegGetValueW(HKEY_CURRENT_USER, L"Software\\Microsoft\\Windows\\CurrentVersion\\Themes\\Personalize",
+                     L"AppsUseLightTheme", RRF_RT_REG_DWORD, nullptr, &value, &size) != ERROR_SUCCESS)
+        return false;
+    return value == 0;
+}
+static void applyTheme(bool force = false) {
+    HIGHCONTRASTW contrast{sizeof(contrast)};
+    bool contrastEnabled = SystemParametersInfoW(SPI_GETHIGHCONTRAST, sizeof(contrast), &contrast, 0) &&
+                           (contrast.dwFlags & HCF_HIGHCONTRASTON);
+    bool useDark = !contrastEnabled && systemUsesDarkTheme();
+    if (!force && backgroundBrush && darkTheme == useDark && highContrast == contrastEnabled) return;
+    darkTheme = useDark;
+    highContrast = contrastEnabled;
+    HBRUSH oldBrush = backgroundBrush;
+    backgroundBrush = CreateSolidBrush(backgroundColor());
+    if (oldBrush) DeleteObject(oldBrush);
+
+    BOOL darkFrame = darkTheme ? TRUE : FALSE;
+    DwmSetWindowAttribute(mainWindow, DWMWA_USE_IMMERSIVE_DARK_MODE, &darkFrame, sizeof(darkFrame));
+    for (HWND list : {leftList, rightList}) {
+        // Explorer's dark visual style is used when available; explicit colors cover the client area.
+        SetWindowTheme(list, highContrast ? nullptr : (darkTheme ? L"DarkMode_Explorer" : L"Explorer"), nullptr);
+        ListView_SetBkColor(list, backgroundColor());
+        ListView_SetTextBkColor(list, backgroundColor());
+        ListView_SetTextColor(list, textColor());
+    }
+    RedrawWindow(mainWindow, nullptr, nullptr, RDW_INVALIDATE | RDW_ERASE | RDW_FRAME | RDW_ALLCHILDREN);
+}
 
 static std::string utf8(const std::wstring& value) {
     if (value.empty()) return {};
@@ -113,27 +170,47 @@ static BOOL CALLBACK collect(HWND handle, LPARAM) {
     return TRUE;
 }
 static void enumerate() { windows.clear(); EnumWindows(collect, 0); }
+static void restoreWindow(Monitored& item) {
+    for (const WindowRestore& saved : item.changedWindows) {
+        if (!IsWindow(saved.handle)) continue;
+        DWORD pid = 0;
+        GetWindowThreadProcessId(saved.handle, &pid);
+        if (pid != saved.pid) continue;
+        SetWindowLongPtrW(saved.handle, GWL_STYLE, saved.style);
+        SetWindowLongPtrW(saved.handle, GWL_EXSTYLE, saved.exstyle);
+        const RECT& r = saved.originalRect;
+        SetWindowPos(saved.handle, nullptr, r.left, r.top, r.right - r.left, r.bottom - r.top,
+                     SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+        SetWindowPlacement(saved.handle, &saved.placement);
+    }
+}
 static void monitor() {
     HWND foreground = GetForegroundWindow();
     for (auto& [name, item] : monitored) {
+        auto& changed = item.changedWindows;
+        changed.erase(std::remove_if(changed.begin(), changed.end(),
+                                     [](const WindowRestore& saved) { return !IsWindow(saved.handle); }), changed.end());
         auto it = windows.find(name);
-        if (it == windows.end()) { item.observed = nullptr; item.modified = nullptr; item.active = false; continue; }
+        if (it == windows.end()) { item.observed = nullptr; item.active = false; continue; }
         Window& win = it->second;
         if (item.observed != win.handle) {
             item.observed = win.handle;
-            item.modified = nullptr;
             item.active = foreground == win.handle;
             if (!win.borderless) {
-                item.style = GetWindowLongPtrW(win.handle, GWL_STYLE);
-                item.exstyle = GetWindowLongPtrW(win.handle, GWL_EXSTYLE);
+                WINDOWPLACEMENT placement{sizeof(placement)};
+                RECT originalRect;
                 MONITORINFO monitorInfo{sizeof(monitorInfo)};
-                if (GetMonitorInfoW(win.monitor, &monitorInfo)) {
+                if (GetWindowPlacement(win.handle, &placement) && GetWindowRect(win.handle, &originalRect) &&
+                    GetMonitorInfoW(win.monitor, &monitorInfo)) {
+                    item.style = GetWindowLongPtrW(win.handle, GWL_STYLE);
+                    item.exstyle = GetWindowLongPtrW(win.handle, GWL_EXSTYLE);
+                    changed.push_back(WindowRestore{win.handle, win.pid, item.style, item.exstyle,
+                                                    placement, originalRect});
                     SetWindowLongPtrW(win.handle, GWL_STYLE, (item.style & ~(WS_CAPTION | WS_THICKFRAME)) | WS_POPUP);
                     SetWindowLongPtrW(win.handle, GWL_EXSTYLE, item.exstyle & ~(WS_EX_WINDOWEDGE | WS_EX_CLIENTEDGE));
                     RECT r = monitorInfo.rcMonitor;
                     SetWindowPos(win.handle, HWND_TOP, r.left, r.top, r.right-r.left, r.bottom-r.top,
                                  SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-                    item.modified = win.handle;
                     win.borderless = true;
                 }
             }
@@ -233,12 +310,7 @@ static void removeSelected() {
         auto found = monitored.find(name);
         if (found == monitored.end()) continue;
         Monitored& item = found->second;
-        if (item.modified && IsWindow(item.modified) && windows.count(name) && windows.at(name).handle == item.modified) {
-            SetWindowLongPtrW(item.modified, GWL_STYLE, item.style);
-            SetWindowLongPtrW(item.modified, GWL_EXSTYLE, item.exstyle);
-            SetWindowPos(item.modified, nullptr, 0, 0, 0, 0,
-                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOOWNERZORDER | SWP_FRAMECHANGED);
-        }
+        restoreWindow(item);
         monitored.erase(found);
     }
     if (!names.empty()) { populate(leftList, true); showDetails(); save(); }
@@ -305,6 +377,7 @@ static LRESULT CALLBACK windowProc(HWND handle, UINT message, WPARAM wparam, LPA
         leftList = makeList(monitoredId); rightList = makeList(runningId);
         details = CreateWindowW(L"STATIC", L"", WS_CHILD | WS_VISIBLE,
                                 0, 0, 0, 0, handle, nullptr, instance, nullptr);
+        applyTheme();
         NONCLIENTMETRICSW metrics{sizeof(metrics)};
         if (SystemParametersInfoW(SPI_GETNONCLIENTMETRICS, sizeof(metrics), &metrics, 0)) {
             HFONT font = CreateFontIndirectW(&metrics.lfMessageFont);
@@ -321,14 +394,23 @@ static LRESULT CALLBACK windowProc(HWND handle, UINT message, WPARAM wparam, LPA
         return 0;
     }
     case WM_SIZE: layout(LOWORD(lparam), HIWORD(lparam)); return 0;
+    case WM_ERASEBKGND: {
+        RECT area;
+        GetClientRect(handle, &area);
+        FillRect((HDC)wparam, &area, backgroundBrush ? backgroundBrush : GetSysColorBrush(COLOR_WINDOW));
+        return 1;
+    }
     case WM_CTLCOLORSTATIC: {
         HDC dc = (HDC)wparam;
-        SetTextColor(dc, GetSysColor(COLOR_WINDOWTEXT));
-        SetBkColor(dc, GetSysColor(COLOR_WINDOW));
+        SetTextColor(dc, textColor());
+        SetBkColor(dc, backgroundColor());
         SetBkMode(dc, OPAQUE);
-        return (LRESULT)GetSysColorBrush(COLOR_WINDOW);
+        return (LRESULT)(backgroundBrush ? backgroundBrush : GetSysColorBrush(COLOR_WINDOW));
     }
-    case WM_TIMER: if (wparam == 1) refresh(); return 0;
+    case WM_SETTINGCHANGE: applyTheme(); return 0;
+    case WM_SYSCOLORCHANGE: applyTheme(true); return 0;
+    case WM_THEMECHANGED: applyTheme(); return 0;
+    case WM_TIMER: if (wparam == 1) { applyTheme(); refresh(); } return 0;
     case WM_NOTIFY: {
         auto* event = (NMHDR*)lparam;
         if (event->code == NM_DBLCLK) {
@@ -364,6 +446,7 @@ static LRESULT CALLBACK windowProc(HWND handle, UINT message, WPARAM wparam, LPA
         NOTIFYICONDATAW tray{sizeof(tray)}; tray.hWnd = handle; tray.uID = 1;
         Shell_NotifyIconW(NIM_DELETE, &tray);
         ImageList_Destroy(images);
+        if (backgroundBrush) DeleteObject(backgroundBrush);
         if (HANDLE font = GetPropW(handle, L"BWH.Font")) DeleteObject(font);
         PostQuitMessage(0); return 0;
     }
