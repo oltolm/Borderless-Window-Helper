@@ -26,6 +26,8 @@ cmake --build build --parallel $env:NUMBER_OF_PROCESSORS
 Settings remain in `bwh.ini` beside the executable when that file exists, otherwise in `%APPDATA%\Borderless-Window-Helper\bwh.ini`.
 
 ## Download
+[Latest release](https://github.com/oltolm/Borderless-Window-Helper/releases/latest)
+
 [Borderless Window Helper 1.3.zip](https://github.com/ErrorFlynn/Borderless-Window-Helper/releases/download/v1.3/Borderless.Window.Helper.1.3.zip)
 
 * [window ghosting](https://blogs.technet.microsoft.com/askperf/2010/09/10/de-ghosting-your-windows/) no longer causes the program to minimize the game window
